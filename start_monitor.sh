@@ -5,12 +5,12 @@
 # 请修改以下配置
 
 # Telegram 配置
-export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN_HERE"
-export TELEGRAM_CHAT_ID="YOUR_CHAT_ID_HERE"
+export TELEGRAM_BOT_TOKEN="8283010813:AAF9rhH3yV_oD5EUTleCiWNvQs3HPQ6M41U"
+export TELEGRAM_CHAT_ID="6190291125"
 
 # 你当前预约的日期（格式：MM/DD/YYYY）
 # 脚本会监控所有比这个日期更早的可用名额
-export TARGET_DATE="03/01/2026"
+export TARGET_DATE="22/12/2025"
 
 # 检查间隔（秒）- 建议 300-600 秒
 export CHECK_INTERVAL="300"
