@@ -10,7 +10,7 @@ export TELEGRAM_CHAT_ID="6190291125"
 
 # 你当前预约的日期（格式：MM/DD/YYYY）
 # 脚本会监控所有比这个日期更早的可用名额
-export TARGET_DATE="22/12/2025"
+export TARGET_DATE="12/22/2025"
 
 # 检查间隔（秒）- 建议 300-600 秒
 export CHECK_INTERVAL="300"
