@@ -21,6 +21,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import logging
+import pytz
 
 # 配置日志
 logging.basicConfig(
@@ -49,6 +50,19 @@ MONITOR_OFFICES = os.environ.get('MONITOR_OFFICES', '').split(',') if os.environ
 
 # API URL
 API_URL = "https://eservices.es2.immd.gov.hk/surgecontrolgate/ticket/getSituation?svcId=579"
+
+# 整点密集检查配置（中国时间）
+# 在这些小时的整点前后会进行密集检查
+HOT_HOURS = [0, 12]  # 0点和12点
+
+# 整点密集检查的时间点（秒）：整点、30秒后、1分钟后
+BURST_CHECK_OFFSETS = [0, 30, 60]
+
+# 整点前多少秒开始准备（提前等待）
+PREPARE_BEFORE_SECONDS = 5
+
+# 中国时区
+CHINA_TZ = pytz.timezone('Asia/Shanghai')
 
 # ==================== 配置结束 ====================
 
@@ -160,6 +174,29 @@ def send_telegram_notification(message: str) -> bool:
         return False
 
 
+def test_telegram() -> bool:
+    """测试 Telegram 连接"""
+    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE' or TELEGRAM_CHAT_ID == 'YOUR_CHAT_ID_HERE':
+        logger.warning("⚠️ Telegram 未配置，请设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID")
+        return False
+
+    logger.info("🔔 测试 Telegram 连接...")
+    now = get_china_time().strftime('%Y-%m-%d %H:%M:%S')
+    test_message = f"✅ <b>香港身份证预约监控已启动</b>\n\n"
+    test_message += f"⏰ 启动时间（中国时间）: {now}\n"
+    test_message += f"📅 目标日期: {TARGET_DATE}\n"
+    test_message += f"🔥 整点检查时间: {HOT_HOURS} 点\n"
+    test_message += f"⏱️ 常规检查间隔: {CHECK_INTERVAL} 秒\n\n"
+    test_message += "监控已开始运行，发现新名额时会自动通知您。"
+
+    success = send_telegram_notification(test_message)
+    if success:
+        logger.info("✅ Telegram 测试成功！")
+    else:
+        logger.error("❌ Telegram 测试失败，请检查配置")
+    return success
+
+
 def format_notification(slots: List[Dict], target_date: str) -> str:
     """格式化通知消息"""
     message = "🎉 <b>香港身份证预约名额提醒</b>\n\n"
@@ -193,6 +230,118 @@ def get_earliest_available(data: Dict) -> Optional[Dict]:
                 'status_text': QUOTA_STATUS.get(slot['quotaR'], slot['quotaR'])
             }
     return None
+
+
+def get_china_time() -> datetime:
+    """获取当前中国时间"""
+    return datetime.now(CHINA_TZ)
+
+
+def get_seconds_to_next_hot_hour() -> tuple:
+    """
+    计算距离下一个整点检查时间的秒数
+
+    Returns:
+        (seconds_to_hot_hour, next_hot_hour): 距离下个整点的秒数和那个整点的小时数
+    """
+    now = get_china_time()
+    current_hour = now.hour
+    current_minute = now.minute
+    current_second = now.second
+
+    # 当前时间距离本小时整点的秒数
+    seconds_into_hour = current_minute * 60 + current_second
+
+    # 找到下一个热门小时
+    next_hot_hour = None
+    for hot_hour in sorted(HOT_HOURS):
+        if hot_hour > current_hour:
+            next_hot_hour = hot_hour
+            break
+
+    if next_hot_hour is None:
+        # 没找到今天的，用明天的第一个
+        next_hot_hour = sorted(HOT_HOURS)[0]
+        hours_until = (24 - current_hour) + next_hot_hour
+    else:
+        hours_until = next_hot_hour - current_hour
+
+    # 如果正好是热门小时且还在第一分钟内，返回0
+    if current_hour in HOT_HOURS and seconds_into_hour <= max(BURST_CHECK_OFFSETS) + 10:
+        return (0, current_hour)
+
+    # 计算秒数
+    seconds_to_hot = (hours_until * 3600) - seconds_into_hour
+
+    return (seconds_to_hot, next_hot_hour)
+
+
+def is_burst_check_time() -> bool:
+    """检查当前是否是密集检查时间（整点前后）"""
+    now = get_china_time()
+
+    if now.hour not in HOT_HOURS:
+        return False
+
+    # 在整点后的检查窗口内
+    seconds_into_hour = now.minute * 60 + now.second
+    return seconds_into_hour <= max(BURST_CHECK_OFFSETS) + 10
+
+
+def perform_burst_checks(target_date: datetime, last_notified: set, offices_to_check: List[str]) -> set:
+    """
+    在整点时执行密集检查（整点、30秒后、1分钟后）
+
+    Returns:
+        更新后的 last_notified 集合
+    """
+    now = get_china_time()
+    logger.info(f"🔥 整点密集检查模式启动！当前中国时间: {now.strftime('%H:%M:%S')}")
+
+    for i, offset in enumerate(BURST_CHECK_OFFSETS):
+        # 计算需要等待的时间
+        current_second = get_china_time().minute * 60 + get_china_time().second
+        wait_time = offset - current_second
+
+        if wait_time > 0:
+            logger.info(f"⏳ 等待 {wait_time} 秒后进行第 {i+1} 次检查...")
+            time.sleep(wait_time)
+
+        # 执行检查
+        check_time = get_china_time().strftime('%H:%M:%S')
+        logger.info(f"🔍 第 {i+1}/{len(BURST_CHECK_OFFSETS)} 次密集检查 [{check_time}]")
+
+        data = fetch_quota_data()
+        if data:
+            print_status_summary(data)
+            available = find_available_slots(data, target_date, offices_to_check)
+
+            if available:
+                slot_keys = {f"{s['date']}_{s['office_id']}" for s in available}
+                new_slots = slot_keys - last_notified
+
+                if new_slots:
+                    new_available = [s for s in available if f"{s['date']}_{s['office_id']}" in new_slots]
+                    logger.info(f"🎉🎉🎉 发现 {len(new_available)} 个新名额！")
+
+                    message = f"⚡ <b>整点放号提醒</b> [{check_time}]\n\n"
+                    message += format_notification(new_available, TARGET_DATE)
+                    send_telegram_notification(message)
+
+                    last_notified.update(new_slots)
+                else:
+                    logger.info(f"检查完成，暂无新名额")
+            else:
+                logger.info("本次检查无可用名额")
+        else:
+            logger.warning("获取数据失败")
+
+        # 短暂等待避免请求过快（除了最后一次）
+        if i < len(BURST_CHECK_OFFSETS) - 1:
+            time.sleep(0.5)
+
+    logger.info("✅ 整点密集检查完成")
+    return last_notified
 
 
 def print_status_summary(data: Dict):
@@ -234,13 +383,40 @@ def run_monitor():
     logger.info(f"目标日期: {TARGET_DATE}")
     logger.info(f"检查间隔: {CHECK_INTERVAL} 秒")
     logger.info(f"监控办事处: {MONITOR_OFFICES if MONITOR_OFFICES else '全部'}")
+    logger.info(f"整点密集检查时间（中国时间）: {HOT_HOURS} 点")
+    logger.info(f"当前中国时间: {get_china_time().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 启动时测试 Telegram
+    test_telegram()
 
     target_date = parse_date(TARGET_DATE)
     last_notified = set()  # 避免重复通知
+    offices_to_check = MONITOR_OFFICES if MONITOR_OFFICES else None
 
     while True:
         try:
-            logger.info("正在检查预约名额...")
+            # 检查是否接近整点检查时间
+            seconds_to_hot, next_hot = get_seconds_to_next_hot_hour()
+
+            # 如果距离整点不到准备时间，进入等待状态
+            if 0 < seconds_to_hot <= PREPARE_BEFORE_SECONDS + CHECK_INTERVAL:
+                wait_time = max(0, seconds_to_hot - PREPARE_BEFORE_SECONDS)
+                logger.info(f"⏰ 距离 {next_hot}:00 整点检查还有 {seconds_to_hot} 秒")
+                if wait_time > 0:
+                    logger.info(f"⏳ 等待 {wait_time} 秒后开始整点密集检查...")
+                    time.sleep(wait_time)
+
+                # 执行整点密集检查
+                last_notified = perform_burst_checks(target_date, last_notified, offices_to_check)
+
+                # 整点检查后等待一段时间再恢复正常检查
+                logger.info(f"整点检查完成，{CHECK_INTERVAL} 秒后恢复正常检查")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # 正常检查
+            now_china = get_china_time().strftime('%H:%M:%S')
+            logger.info(f"正在检查预约名额... [中国时间 {now_china}]")
             data = fetch_quota_data()
 
             if data:
@@ -248,7 +424,6 @@ def run_monitor():
                 print_status_summary(data)
 
                 # 查找可用名额
-                offices_to_check = MONITOR_OFFICES if MONITOR_OFFICES else None
                 available = find_available_slots(data, target_date, offices_to_check)
 
                 if available:
@@ -278,8 +453,11 @@ def run_monitor():
             else:
                 logger.warning("获取数据失败，将在下次检查时重试")
 
-            # 等待下次检查
-            logger.info(f"下次检查: {CHECK_INTERVAL} 秒后")
+            # 计算下次检查时间，显示距离整点的时间
+            seconds_to_hot, next_hot = get_seconds_to_next_hot_hour()
+            hours = seconds_to_hot // 3600
+            mins = (seconds_to_hot % 3600) // 60
+            logger.info(f"下次检查: {CHECK_INTERVAL} 秒后 | 距离 {next_hot}:00 整点检查: {hours}小时{mins}分钟")
             time.sleep(CHECK_INTERVAL)
 
         except KeyboardInterrupt:
@@ -287,6 +465,8 @@ def run_monitor():
             break
         except Exception as e:
             logger.error(f"发生错误: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(60)  # 出错后等待1分钟再重试
 
 
